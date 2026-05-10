@@ -7,6 +7,8 @@ import type { ExtractedContent } from "./extract.js";
 
 const ZAI_SEARCH_MCP_URL = "https://api.z.ai/api/mcp/web_search_prime/mcp";
 const ZAI_READER_MCP_URL = "https://api.z.ai/api/mcp/web_reader/mcp";
+const ZAI_SEARCH_TOOL_NAME = "web_search_prime";
+const ZAI_READER_TOOL_NAME = "webReader";
 const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 
 interface WebSearchConfig {
@@ -123,16 +125,67 @@ async function callZaiMcp(
 	apiKey: string,
 	signal?: AbortSignal,
 ): Promise<string> {
-	const response = await fetch(endpoint, {
+	const baseHeaders: Record<string, string> = {
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+		"Authorization": `Bearer ${apiKey}`,
+	};
+
+	// Step 1: Initialize MCP session
+	const initResponse = await fetch(endpoint, {
 		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"Accept": "application/json, text/event-stream",
-			"Authorization": `Bearer ${apiKey}`,
-		},
+		headers: baseHeaders,
 		body: JSON.stringify({
 			jsonrpc: "2.0",
 			id: 1,
+			method: "initialize",
+			params: {
+				protocolVersion: "2025-03-26",
+				capabilities: {},
+				clientInfo: { name: "pi-web-access", version: "1.0" },
+			},
+		}),
+		signal: requestSignal(signal),
+	});
+
+	if (!initResponse.ok) {
+		const errorText = await initResponse.text();
+		throw new Error(`z.ai MCP initialize error ${initResponse.status}: ${errorText.slice(0, 300)}`);
+	}
+
+	// Capture session ID from response headers
+	const sessionId = initResponse.headers.get("mcp-session-id");
+	if (!sessionId) {
+		throw new Error("z.ai MCP did not return a session ID");
+	}
+
+	// Parse initialize response to confirm it worked
+	await parseSseResponse(await initResponse.text());
+
+	// Step 2: Send initialized notification
+	await fetch(endpoint, {
+		method: "POST",
+		headers: {
+			...baseHeaders,
+			"Mcp-Session-Id": sessionId,
+		},
+		body: JSON.stringify({
+			jsonrpc: "2.0",
+			method: "notifications/initialized",
+		}),
+		signal: requestSignal(signal),
+	});
+
+	// Step 3: Call the tool with session
+	const toolResponse = await fetch(endpoint, {
+		method: "POST",
+		headers: {
+			...baseHeaders,
+			"Mcp-Session-Id": sessionId,
+		},
+		body: JSON.stringify({
+			jsonrpc: "2.0",
+			id: 2,
 			method: "tools/call",
 			params: {
 				name: toolName,
@@ -142,45 +195,13 @@ async function callZaiMcp(
 		signal: requestSignal(signal),
 	});
 
-	if (!response.ok) {
-		const errorText = await response.text();
-		throw new Error(`z.ai MCP error ${response.status}: ${errorText.slice(0, 300)}`);
+	if (!toolResponse.ok) {
+		const errorText = await toolResponse.text();
+		throw new Error(`z.ai MCP tool call error ${toolResponse.status}: ${errorText.slice(0, 300)}`);
 	}
 
-	const body = await response.text();
-
-	// Try parsing SSE-style response (data: lines)
-	const dataLines = body.split("\n").filter((line) => line.startsWith("data:"));
-	let parsed: ZaiMcpRpcResponse | null = null;
-	for (const line of dataLines) {
-		const payload = line.slice(5).trim();
-		if (!payload) continue;
-		try {
-			const candidate = JSON.parse(payload) as ZaiMcpRpcResponse;
-			if (candidate?.result || candidate?.error) {
-				parsed = candidate;
-				break;
-			}
-		} catch {
-			// Try next line
-		}
-	}
-
-	// Fallback: try parsing entire body as JSON
-	if (!parsed) {
-		try {
-			const candidate = JSON.parse(body) as ZaiMcpRpcResponse;
-			if (candidate?.result || candidate?.error) {
-				parsed = candidate;
-			}
-		} catch {
-			// Not JSON
-		}
-	}
-
-	if (!parsed) {
-		throw new Error("z.ai MCP returned an empty response");
-	}
+	const body = await toolResponse.text();
+	const parsed = await parseSseResponse(body);
 
 	if (parsed.error) {
 		const code = typeof parsed.error.code === "number" ? ` ${parsed.error.code}` : "";
@@ -210,32 +231,74 @@ async function callZaiMcp(
 	return text;
 }
 
+/** Parse SSE or plain JSON response from z.ai MCP. */
+async function parseSseResponse(body: string): Promise<ZaiMcpRpcResponse> {
+	// Try parsing SSE-style response (data: lines)
+	const dataLines = body.split("\n").filter((line) => line.startsWith("data:"));
+	for (const line of dataLines) {
+		const payload = line.slice(5).trim();
+		if (!payload) continue;
+		try {
+			const candidate = JSON.parse(payload) as ZaiMcpRpcResponse;
+			if (candidate?.result || candidate?.error) {
+				return candidate;
+			}
+		} catch {
+			// Try next line
+		}
+	}
+
+	// Fallback: try parsing entire body as JSON
+	try {
+		const candidate = JSON.parse(body) as ZaiMcpRpcResponse;
+		if (candidate?.result || candidate?.error) {
+			return candidate;
+		}
+	} catch {
+		// Not JSON
+	}
+
+	throw new Error("z.ai MCP returned an empty response");
+}
+
 // --- Search (webSearchPrime) ---
 
 function parseSearchResults(text: string): { answer: string; results: Array<{ title: string; url: string; snippet: string }> } {
 	const results: Array<{ title: string; url: string; snippet: string }> = [];
 	const seen = new Set<string>();
 
-	// Extract markdown links as sources: [title](url)
+	// z.ai returns a JSON array of search results
+	try {
+		const items = JSON.parse(text) as Array<{ title?: string; link?: string; content?: string; refer?: string }>;
+		if (Array.isArray(items)) {
+			for (const item of items) {
+				const url = item.link || "";
+				if (!url || seen.has(url)) continue;
+				seen.add(url);
+				results.push({
+					title: item.title || new URL(url).hostname,
+					url,
+					snippet: item.content || "",
+				});
+			}
+			if (results.length > 0) {
+				const answer = items
+					.map((item, i) => `${i + 1}. ${item.title || "Source"}\n   ${item.link || ""}\n   ${item.content || ""}`)
+					.join("\n\n");
+				return { answer, results };
+			}
+		}
+	} catch {
+		// Not JSON, fall through to text parsing
+	}
+
+	// Fallback: extract markdown links as sources
 	const linkRegex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
 	for (const match of text.matchAll(linkRegex)) {
 		const url = match[2];
 		if (seen.has(url)) continue;
 		seen.add(url);
 		results.push({ title: match[1], url, snippet: "" });
-	}
-
-	// Also try numbered URL patterns: 1. https://...
-	const urlRegex = /^\s*\d+[\.\)]\s*(https?:\/\/\S+)/gm;
-	for (const match of text.matchAll(urlRegex)) {
-		const url = match[1];
-		if (seen.has(url)) continue;
-		seen.add(url);
-		try {
-			results.push({ title: new URL(url).hostname, url, snippet: "" });
-		} catch {
-			// Skip malformed URLs
-		}
 	}
 
 	return { answer: text, results };
@@ -263,13 +326,23 @@ export async function searchWithZai(
 
 	try {
 		const mcpArgs: Record<string, unknown> = {
-			query,
+			search_query: query,
+			location: "us",
 		};
-		if (options.numResults) mcpArgs.numResults = options.numResults;
+
+		if (options.recencyFilter) {
+			const recencyMap: Record<string, string> = {
+				day: "oneDay",
+				week: "oneWeek",
+				month: "oneMonth",
+				year: "oneYear",
+			};
+			mcpArgs.search_recency_filter = recencyMap[options.recencyFilter] || "noLimit";
+		}
 
 		const text = await callZaiMcp(
 			ZAI_SEARCH_MCP_URL,
-			"webSearchPrime",
+			ZAI_SEARCH_TOOL_NAME,
 			mcpArgs,
 			apiKey,
 			options.signal,
@@ -302,7 +375,7 @@ export async function readWithZai(
 	try {
 		const text = await callZaiMcp(
 			ZAI_READER_MCP_URL,
-			"webReader",
+			ZAI_READER_TOOL_NAME,
 			{ url },
 			apiKey,
 			signal,
