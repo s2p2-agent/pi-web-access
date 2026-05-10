@@ -967,7 +967,7 @@ export default function (pi: ExtensionAPI) {
 							? pc.defaultProvider
 							: normalizedProvider;
 						try {
-							const addSearchZaiKey = await resolveZaiApiKey();
+							const addSearchZaiKey = await resolveZaiApiKey(ctx.modelRegistry);
 							const { answer, results, inlineContent, provider: actualProvider } = await search(query, {
 								provider: requestedProvider,
 								numResults: pc.numResults,
@@ -1163,7 +1163,7 @@ export default function (pi: ExtensionAPI) {
 				let cancelled = false;
 
 				const bootstrap = await loadCuratorBootstrap(params.provider);
-				const zaiApiKey = await resolveZaiApiKey();
+				const zaiApiKey = await resolveZaiApiKey(ctx.modelRegistry);
 				const availableProviders = bootstrap.availableProviders;
 				const defaultProvider = bootstrap.defaultProvider;
 				const curatorTimeoutSeconds = bootstrap.timeoutSeconds;
@@ -1280,7 +1280,7 @@ export default function (pi: ExtensionAPI) {
 			const allUrls: string[] = [];
 			const allInlineContent: ExtractedContent[] = [];
 			const resolvedProvider = normalizeProviderInput(params.provider ?? loadConfig().provider);
-			const zaiApiKey = await resolveZaiApiKey();
+			const zaiApiKey = await resolveZaiApiKey(ctx.modelRegistry);
 
 			for (let i = 0; i < queryList.length; i++) {
 				const query = queryList[i];
@@ -2126,7 +2126,7 @@ export default function (pi: ExtensionAPI) {
 								? currentProvider
 								: normalizedProvider;
 							try {
-								const cmdZaiKey = await resolveZaiApiKey();
+								const cmdZaiKey = await resolveZaiApiKey(ctx.modelRegistry);
 								const { answer, results, provider: actualProvider } = await search(query, {
 									provider: requestedProvider,
 									signal: searchAbort.signal,
@@ -2190,7 +2190,7 @@ export default function (pi: ExtensionAPI) {
 								const { answer, results, provider } = await search(queries[qi], {
 									provider: requestedProvider,
 									signal: searchAbort.signal,
-									zaiApiKey: (await resolveZaiApiKey()) ?? undefined,
+									zaiApiKey: (await resolveZaiApiKey(ctx.modelRegistry)) ?? undefined,
 								});
 								if (aborted || activeCurator !== handle) break;
 								handle.pushResult(qi, {
