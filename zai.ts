@@ -105,7 +105,9 @@ export function isZaiAvailable(): boolean {
 	if (normalizeApiKey(loadConfig().zaiApiKey)) return true;
 	if (normalizeApiKey(process.env.ZAI_API_KEY)) return true;
 	if (cachedApiKey) return true;
-	// Might be available via model registry — return true optimistically
+	// Optimistic: before the first resolveZaiApiKey() call, a model registry key
+	// might be available. After resolution sets cachedApiKey to null, we return false.
+	// This is a best-effort synchronous check — callers should handle search failures.
 	return cachedApiKey === undefined;
 }
 
@@ -229,7 +231,11 @@ function parseSearchResults(text: string): { answer: string; results: Array<{ ti
 		const url = match[1];
 		if (seen.has(url)) continue;
 		seen.add(url);
-		results.push({ title: new URL(url).hostname, url, snippet: "" });
+		try {
+			results.push({ title: new URL(url).hostname, url, snippet: "" });
+		} catch {
+			// Skip malformed URLs
+		}
 	}
 
 	return { answer: text, results };
