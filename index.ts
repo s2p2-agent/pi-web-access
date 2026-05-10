@@ -37,6 +37,7 @@ import { isPerplexityAvailable } from "./perplexity.js";
 import { isExaAvailable } from "./exa.js";
 import { isGeminiApiAvailable } from "./gemini-api.js";
 import { getActiveGoogleEmail, isGeminiWebAvailable } from "./gemini-web.js";
+import { isZaiAvailable, invalidateZaiApiKeyCache, resolveZaiApiKey } from "./zai.js";
 import { isBrowserCookieAccessAllowed } from "./gemini-web-config.ts";
 
 const WEB_SEARCH_CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
@@ -56,6 +57,7 @@ interface ProviderAvailability {
 	perplexity: boolean;
 	exa: boolean;
 	gemini: boolean;
+	zai: boolean;
 }
 
 type WebSearchWorkflow = "none" | "summary-review";
@@ -114,7 +116,7 @@ function normalizeProviderInput(value: unknown): SearchProvider | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string") return "auto";
 	const normalized = value.trim().toLowerCase();
-	if (normalized === "auto" || normalized === "exa" || normalized === "perplexity" || normalized === "gemini") {
+	if (normalized === "auto" || normalized === "exa" || normalized === "perplexity" || normalized === "gemini" || normalized === "zai") {
 		return normalized;
 	}
 	return "auto";
@@ -154,6 +156,7 @@ async function getProviderAvailability(): Promise<ProviderAvailability> {
 		perplexity: isPerplexityAvailable(),
 		exa: isExaAvailable(),
 		gemini: isGeminiApiAvailable() || !!geminiWebAvail,
+		zai: isZaiAvailable(),
 	};
 }
 
@@ -174,6 +177,7 @@ function resolveProvider(
 
 	if (provider === "auto") {
 		if (available.exa) return "exa";
+		if (available.zai) return "zai";
 		if (available.perplexity) return "perplexity";
 		if (available.gemini) return "gemini";
 		return "exa";
@@ -189,6 +193,11 @@ function resolveProvider(
 	if (provider === "gemini" && !available.gemini) {
 		if (available.exa) return "exa";
 		return available.perplexity ? "perplexity" : "gemini";
+	}
+	if (provider === "zai" && !available.zai) {
+		if (available.exa) return "exa";
+		if (available.perplexity) return "perplexity";
+		return available.gemini ? "gemini" : "zai";
 	}
 	return provider;
 }
@@ -452,6 +461,7 @@ function handleSessionChange(ctx: ExtensionContext): void {
 	abortPendingFetches();
 	closeCurator();
 	clearCloneCache();
+	invalidateZaiApiKeyCache();
 	sessionActive = true;
 	restoreFromSession(ctx);
 	// Unsubscribe before clear() to avoid callback with stale ctx
@@ -957,6 +967,7 @@ export default function (pi: ExtensionAPI) {
 							? pc.defaultProvider
 							: normalizedProvider;
 						try {
+							const addSearchZaiKey = await resolveZaiApiKey();
 							const { answer, results, inlineContent, provider: actualProvider } = await search(query, {
 								provider: requestedProvider,
 								numResults: pc.numResults,
@@ -964,6 +975,7 @@ export default function (pi: ExtensionAPI) {
 								domainFilter: pc.domainFilter,
 								includeContent: pc.includeContent,
 								signal: addSearchSignal,
+								zaiApiKey: addSearchZaiKey ?? undefined,
 							});
 							if (pendingCurate !== pc) throw new Error("Curator session is no longer active.");
 							pc.searchResults.set(queryIndex, { query, answer, results, error: null, provider: actualProvider });
@@ -1089,7 +1101,7 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			`Search the web using Perplexity AI, Exa, or Gemini. Returns an AI-synthesized answer with source citations. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation. Provider auto-selects: Exa (direct API with key, MCP fallback without), else Perplexity (needs key), else Gemini API (needs key), else Gemini Web (needs a supported Chromium-based browser login).`,
+			`Search the web using Perplexity AI, Exa, Gemini, or z.ai. Returns an AI-synthesized answer with source citations. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Searches auto-open the interactive browser curator and stream results live; set workflow to "none" to skip curation. Provider auto-selects: Exa (direct API with key, MCP fallback without), else Perplexity (needs key), else Gemini API (needs key), else Gemini Web (needs a supported Chromium-based browser login).`,
 		promptSnippet:
 			"Use for web research questions. Prefer {queries:[...]} with 2-4 varied angles over a single query for broader coverage.",
 		parameters: Type.Object({
@@ -1102,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
 			provider: Type.Optional(
-				StringEnum(["auto", "perplexity", "gemini", "exa"], { description: "Search provider (default: auto)" }),
+				StringEnum(["auto", "perplexity", "gemini", "exa", "zai"], { description: "Search provider (default: auto)" }),
 			),
 			workflow: Type.Optional(
 				StringEnum(["none", "summary-review"], {
@@ -1151,6 +1163,7 @@ export default function (pi: ExtensionAPI) {
 				let cancelled = false;
 
 				const bootstrap = await loadCuratorBootstrap(params.provider);
+				const zaiApiKey = await resolveZaiApiKey();
 				const availableProviders = bootstrap.availableProviders;
 				const defaultProvider = bootstrap.defaultProvider;
 				const curatorTimeoutSeconds = bootstrap.timeoutSeconds;
@@ -1224,6 +1237,7 @@ export default function (pi: ExtensionAPI) {
 							domainFilter: params.domainFilter,
 							includeContent: params.includeContent,
 							signal: searchSignal,
+							zaiApiKey: zaiApiKey ?? undefined,
 						});
 						if (signal?.aborted || cancelled || searchAbort.signal.aborted) break;
 						searchResults.set(qi, { query: queryList[qi], answer, results, error: null, provider });
@@ -1266,6 +1280,7 @@ export default function (pi: ExtensionAPI) {
 			const allUrls: string[] = [];
 			const allInlineContent: ExtractedContent[] = [];
 			const resolvedProvider = normalizeProviderInput(params.provider ?? loadConfig().provider);
+			const zaiApiKey = await resolveZaiApiKey();
 
 			for (let i = 0; i < queryList.length; i++) {
 				const query = queryList[i];
@@ -1283,6 +1298,7 @@ export default function (pi: ExtensionAPI) {
 						domainFilter: params.domainFilter,
 						includeContent: params.includeContent,
 						signal,
+						zaiApiKey: zaiApiKey ?? undefined,
 					});
 
 					searchResults.push({ query, answer, results, error: null, provider });
@@ -2110,9 +2126,11 @@ export default function (pi: ExtensionAPI) {
 								? currentProvider
 								: normalizedProvider;
 							try {
+								const cmdZaiKey = await resolveZaiApiKey();
 								const { answer, results, provider: actualProvider } = await search(query, {
 									provider: requestedProvider,
 									signal: searchAbort.signal,
+									zaiApiKey: cmdZaiKey ?? undefined,
 								});
 								if (commandHandle && activeCurator !== commandHandle) {
 									throw new Error("Curator session is no longer active.");
@@ -2172,6 +2190,7 @@ export default function (pi: ExtensionAPI) {
 								const { answer, results, provider } = await search(queries[qi], {
 									provider: requestedProvider,
 									signal: searchAbort.signal,
+									zaiApiKey: (await resolveZaiApiKey()) ?? undefined,
 								});
 								if (aborted || activeCurator !== handle) break;
 								handle.pushResult(qi, {
