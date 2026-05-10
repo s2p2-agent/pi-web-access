@@ -10,6 +10,7 @@ import { isYouTubeURL, isYouTubeEnabled, extractYouTube, extractYouTubeFrame, ex
 import { extractWithUrlContext, extractWithGeminiWeb } from "./gemini-url-context.js";
 import { isVideoFile, extractVideo, extractVideoFrame, getLocalVideoDuration } from "./video-extract.js";
 import { formatSeconds } from "./utils.js";
+import { readWithZai, resolveZaiApiKey } from "./zai.js";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const CONCURRENT_LIMIT = 3;
@@ -420,6 +421,18 @@ export async function extractContent(
 	if (jinaResult) return jinaResult;
 	if (signal?.aborted) return abortedResult(url);
 
+	// z.ai webReader fallback
+	try {
+		const zaiKey = await resolveZaiApiKey();
+		if (zaiKey) {
+			const zaiResult = await readWithZai(url, zaiKey, signal);
+			if (zaiResult && zaiResult.content.length >= MIN_USEFUL_CONTENT) return zaiResult;
+		}
+	} catch (err) {
+		if (isAbortError(err)) return abortedResult(url);
+	}
+	if (signal?.aborted) return abortedResult(url);
+
 	let geminiResult: ExtractedContent | null = null;
 	try {
 		geminiResult = await extractWithUrlContext(url, signal)
@@ -438,6 +451,7 @@ export async function extractContent(
 		httpResult.error,
 		"",
 		"Fallback options:",
+		"  \u2022 Add z.ai as a provider in pi (or set ZAI_API_KEY)",
 		"  \u2022 Set GEMINI_API_KEY in ~/.pi/web-search.json",
 		"  \u2022 Sign into gemini.google.com in Chrome",
 		"  \u2022 Use web_search to find content about this topic",
