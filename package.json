@@ -41,5 +41,8 @@
       "./skills"
     ],
     "video": "https://github.com/nicobailon/pi-web-access/raw/refs/heads/main/pi-web-fetch-demo.mp4"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
   }
 }
