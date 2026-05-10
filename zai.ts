@@ -1,0 +1,327 @@
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { activityMonitor } from "./activity.js";
+import type { SearchOptions, SearchResponse } from "./perplexity.js";
+import type { ExtractedContent } from "./extract.js";
+
+const ZAI_SEARCH_MCP_URL = "https://api.z.ai/api/mcp/web_search_prime/mcp";
+const ZAI_READER_MCP_URL = "https://api.z.ai/api/mcp/web_reader/mcp";
+const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
+
+interface WebSearchConfig {
+	zaiApiKey?: unknown;
+}
+
+interface ZaiMcpRpcResponse {
+	result?: {
+		content?: Array<{ type?: string; text?: string }>;
+		isError?: boolean;
+	};
+	error?: {
+		code?: number;
+		message?: string;
+	};
+}
+
+let cachedConfig: WebSearchConfig | null = null;
+let cachedApiKey: string | null | undefined = undefined;
+
+function loadConfig(): WebSearchConfig {
+	if (cachedConfig) return cachedConfig;
+	if (!existsSync(CONFIG_PATH)) {
+		cachedConfig = {};
+		return cachedConfig;
+	}
+	const raw = readFileSync(CONFIG_PATH, "utf-8");
+	try {
+		cachedConfig = JSON.parse(raw) as WebSearchConfig;
+		return cachedConfig;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
+}
+
+function normalizeApiKey(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : null;
+}
+
+/**
+ * Resolve z.ai API key.
+ * Priority: cached → model registry lookup → config file → env var.
+ */
+export async function resolveZaiApiKey(
+	modelRegistry?: {
+		getAvailable(): Promise<Array<{ provider: string }>>;
+		getApiKeyAndHeaders(model: { provider: string }): Promise<{ ok: boolean; apiKey?: string }>;
+	},
+): Promise<string | null> {
+	if (cachedApiKey !== undefined) return cachedApiKey;
+
+	// 1. Try model registry
+	if (modelRegistry) {
+		try {
+			const available = await modelRegistry.getAvailable();
+			const zaiModel = available.find((m) => m.provider === "zai");
+			if (zaiModel) {
+				const auth = await modelRegistry.getApiKeyAndHeaders(zaiModel);
+				if (auth.ok && auth.apiKey) {
+					cachedApiKey = auth.apiKey;
+					return cachedApiKey;
+				}
+			}
+		} catch {
+			// Registry not available or no zai provider, continue to fallbacks
+		}
+	}
+
+	// 2. Config file
+	const configKey = normalizeApiKey(loadConfig().zaiApiKey);
+	if (configKey) {
+		cachedApiKey = configKey;
+		return cachedApiKey;
+	}
+
+	// 3. Environment variable
+	const envKey = normalizeApiKey(process.env.ZAI_API_KEY);
+	if (envKey) {
+		cachedApiKey = envKey;
+		return cachedApiKey;
+	}
+
+	cachedApiKey = null;
+	return null;
+}
+
+/** Invalidate cached API key (called on session change). */
+export function invalidateZaiApiKeyCache(): void {
+	cachedApiKey = undefined;
+}
+
+export function isZaiAvailable(): boolean {
+	if (normalizeApiKey(loadConfig().zaiApiKey)) return true;
+	if (normalizeApiKey(process.env.ZAI_API_KEY)) return true;
+	if (cachedApiKey) return true;
+	// Might be available via model registry — return true optimistically
+	return cachedApiKey === undefined;
+}
+
+function requestSignal(signal?: AbortSignal): AbortSignal {
+	const timeout = AbortSignal.timeout(60000);
+	return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+async function callZaiMcp(
+	endpoint: string,
+	toolName: string,
+	args: Record<string, unknown>,
+	apiKey: string,
+	signal?: AbortSignal,
+): Promise<string> {
+	const response = await fetch(endpoint, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"Accept": "application/json, text/event-stream",
+			"Authorization": `Bearer ${apiKey}`,
+		},
+		body: JSON.stringify({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "tools/call",
+			params: {
+				name: toolName,
+				arguments: args,
+			},
+		}),
+		signal: requestSignal(signal),
+	});
+
+	if (!response.ok) {
+		const errorText = await response.text();
+		throw new Error(`z.ai MCP error ${response.status}: ${errorText.slice(0, 300)}`);
+	}
+
+	const body = await response.text();
+
+	// Try parsing SSE-style response (data: lines)
+	const dataLines = body.split("\n").filter((line) => line.startsWith("data:"));
+	let parsed: ZaiMcpRpcResponse | null = null;
+	for (const line of dataLines) {
+		const payload = line.slice(5).trim();
+		if (!payload) continue;
+		try {
+			const candidate = JSON.parse(payload) as ZaiMcpRpcResponse;
+			if (candidate?.result || candidate?.error) {
+				parsed = candidate;
+				break;
+			}
+		} catch {
+			// Try next line
+		}
+	}
+
+	// Fallback: try parsing entire body as JSON
+	if (!parsed) {
+		try {
+			const candidate = JSON.parse(body) as ZaiMcpRpcResponse;
+			if (candidate?.result || candidate?.error) {
+				parsed = candidate;
+			}
+		} catch {
+			// Not JSON
+		}
+	}
+
+	if (!parsed) {
+		throw new Error("z.ai MCP returned an empty response");
+	}
+
+	if (parsed.error) {
+		const code = typeof parsed.error.code === "number" ? ` ${parsed.error.code}` : "";
+		const message = parsed.error.message || "Unknown error";
+		throw new Error(`z.ai MCP error${code}: ${message}`);
+	}
+
+	if (parsed.result?.isError) {
+		const message =
+			parsed.result.content
+				?.find((item) => item.type === "text" && typeof item.text === "string")
+				?.text?.trim();
+		throw new Error(message || "z.ai MCP returned an error");
+	}
+
+	const text = parsed.result?.content
+		?.find(
+			(item) =>
+				item.type === "text" && typeof item.text === "string" && item.text.trim().length > 0,
+		)
+		?.text;
+
+	if (!text) {
+		throw new Error("z.ai MCP returned empty content");
+	}
+
+	return text;
+}
+
+// --- Search (webSearchPrime) ---
+
+function parseSearchResults(text: string): { answer: string; results: Array<{ title: string; url: string; snippet: string }> } {
+	const results: Array<{ title: string; url: string; snippet: string }> = [];
+	const seen = new Set<string>();
+
+	// Extract markdown links as sources: [title](url)
+	const linkRegex = /\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g;
+	for (const match of text.matchAll(linkRegex)) {
+		const url = match[2];
+		if (seen.has(url)) continue;
+		seen.add(url);
+		results.push({ title: match[1], url, snippet: "" });
+	}
+
+	// Also try numbered URL patterns: 1. https://...
+	const urlRegex = /^\s*\d+[\.\)]\s*(https?:\/\/\S+)/gm;
+	for (const match of text.matchAll(urlRegex)) {
+		const url = match[1];
+		if (seen.has(url)) continue;
+		seen.add(url);
+		results.push({ title: new URL(url).hostname, url, snippet: "" });
+	}
+
+	return { answer: text, results };
+}
+
+export interface ZaiSearchOptions extends SearchOptions {
+	zaiApiKey?: string;
+}
+
+export async function searchWithZai(
+	query: string,
+	options: ZaiSearchOptions = {},
+): Promise<SearchResponse> {
+	const apiKey = options.zaiApiKey ?? (await resolveZaiApiKey()) ?? "";
+	if (!apiKey) {
+		throw new Error(
+			"z.ai API key not found. Either:\n" +
+				'  1. Add z.ai as a provider in pi (the same key is reused)\n' +
+				`  2. Set zaiApiKey in ${CONFIG_PATH}\n` +
+				"  3. Set ZAI_API_KEY environment variable",
+		);
+	}
+
+	const activityId = activityMonitor.logStart({ type: "api", query });
+
+	try {
+		const mcpArgs: Record<string, unknown> = {
+			query,
+		};
+		if (options.numResults) mcpArgs.numResults = options.numResults;
+
+		const text = await callZaiMcp(
+			ZAI_SEARCH_MCP_URL,
+			"webSearchPrime",
+			mcpArgs,
+			apiKey,
+			options.signal,
+		);
+
+		const { answer, results } = parseSearchResults(text);
+		activityMonitor.logComplete(activityId, 200);
+
+		return { answer, results };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		if (message.toLowerCase().includes("abort")) {
+			activityMonitor.logComplete(activityId, 0);
+		} else {
+			activityMonitor.logError(activityId, message);
+		}
+		throw err;
+	}
+}
+
+// --- Reader (webReader) ---
+
+export async function readWithZai(
+	url: string,
+	apiKey: string,
+	signal?: AbortSignal,
+): Promise<ExtractedContent | null> {
+	const activityId = activityMonitor.logStart({ type: "api", query: `zai-reader: ${url}` });
+
+	try {
+		const text = await callZaiMcp(
+			ZAI_READER_MCP_URL,
+			"webReader",
+			{ url },
+			apiKey,
+			signal,
+		);
+
+		activityMonitor.logComplete(activityId, 200);
+
+		if (!text || text.trim().length === 0) return null;
+
+		const titleMatch = text.match(/^#{1,2}\s+(.+)/m);
+		const title = titleMatch ? titleMatch[1].replace(/\*+/g, "").trim() : new URL(url).hostname;
+
+		return {
+			url,
+			title,
+			content: text,
+			error: null,
+		};
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		if (message.toLowerCase().includes("abort")) {
+			activityMonitor.logComplete(activityId, 0);
+		} else {
+			activityMonitor.logError(activityId, message);
+		}
+		return null;
+	}
+}
