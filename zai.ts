@@ -162,19 +162,23 @@ async function callZaiMcp(
 	// Parse initialize response to confirm it worked
 	await parseSseResponse(await initResponse.text());
 
-	// Step 2: Send initialized notification
-	await fetch(endpoint, {
-		method: "POST",
-		headers: {
-			...baseHeaders,
-			"Mcp-Session-Id": sessionId,
-		},
-		body: JSON.stringify({
-			jsonrpc: "2.0",
-			method: "notifications/initialized",
-		}),
-		signal: requestSignal(signal),
-	});
+	// Step 2: Send initialized notification (fire and forget, response is ignored)
+	try {
+		await fetch(endpoint, {
+			method: "POST",
+			headers: {
+				...baseHeaders,
+				"Mcp-Session-Id": sessionId,
+			},
+			body: JSON.stringify({
+				jsonrpc: "2.0",
+				method: "notifications/initialized",
+			}),
+			signal: requestSignal(signal),
+		});
+	} catch {
+		// Notification response is non-critical; some servers return errors for notifications
+	}
 
 	// Step 3: Call the tool with session
 	const toolResponse = await fetch(endpoint, {
