@@ -271,29 +271,42 @@ function parseSearchResults(text: string): { answer: string; results: Array<{ ti
 	const results: Array<{ title: string; url: string; snippet: string }> = [];
 	const seen = new Set<string>();
 
-	// z.ai returns a JSON array of search results
+	// z.ai returns a double-encoded JSON string of search results
+	// The text field is a JSON string containing a JSON array: ""[{...}]""
+	let items: Array<{ title?: string; link?: string; content?: string; refer?: string }>;
 	try {
-		const items = JSON.parse(text) as Array<{ title?: string; link?: string; content?: string; refer?: string }>;
-		if (Array.isArray(items)) {
-			for (const item of items) {
-				const url = item.link || "";
-				if (!url || seen.has(url)) continue;
-				seen.add(url);
-				results.push({
-					title: item.title || new URL(url).hostname,
-					url,
-					snippet: item.content || "",
-				});
-			}
-			if (results.length > 0) {
-				const answer = items
-					.map((item, i) => `${i + 1}. ${item.title || "Source"}\n   ${item.link || ""}\n   ${item.content || ""}`)
-					.join("\n\n");
-				return { answer, results };
-			}
+		const parsed = JSON.parse(text);
+		// If the first parse returns a string, parse again (double-encoded)
+		const rawItems = typeof parsed === "string" ? JSON.parse(parsed) : parsed;
+		if (Array.isArray(rawItems)) {
+			items = rawItems;
+		} else {
+			items = [];
 		}
 	} catch {
-		// Not JSON, fall through to text parsing
+		items = [];
+	}
+
+	for (const item of items) {
+		const url = item.link || "";
+		if (!url || seen.has(url)) continue;
+		seen.add(url);
+		try {
+			results.push({
+				title: item.title || new URL(url).hostname,
+				url,
+				snippet: item.content || "",
+			});
+		} catch {
+			// Skip malformed URLs
+		}
+	}
+
+	if (results.length > 0) {
+		const answer = items
+			.map((item, i) => `${i + 1}. ${item.title || "Source"}\n   ${item.link || ""}\n   ${item.content || ""}`)
+			.join("\n\n");
+		return { answer, results };
 	}
 
 	// Fallback: extract markdown links as sources
