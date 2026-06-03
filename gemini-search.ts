@@ -6,8 +6,9 @@ import { getApiKey, API_BASE, DEFAULT_MODEL } from "./gemini-api.js";
 import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.js";
 import { isPerplexityAvailable, searchWithPerplexity, type SearchResult, type SearchResponse, type SearchOptions } from "./perplexity.js";
 import { hasExaApiKey, isExaAvailable, searchWithExa } from "./exa.js";
+import { searchWithZai } from "./zai.js";
 
-export type SearchProvider = "auto" | "perplexity" | "gemini" | "exa";
+export type SearchProvider = "auto" | "perplexity" | "gemini" | "exa" | "zai";
 export type ResolvedSearchProvider = Exclude<SearchProvider, "auto">;
 
 export interface AttributedSearchResponse extends SearchResponse {
@@ -57,7 +58,7 @@ function normalizeSearchModel(value: unknown): string | undefined {
 
 function normalizeSearchProvider(value: unknown): SearchProvider {
 	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-	return normalized === "auto" || normalized === "perplexity" || normalized === "gemini" || normalized === "exa"
+	return normalized === "auto" || normalized === "perplexity" || normalized === "gemini" || normalized === "exa" || normalized === "zai"
 		? normalized
 		: "auto";
 }
@@ -65,6 +66,7 @@ function normalizeSearchProvider(value: unknown): SearchProvider {
 export interface FullSearchOptions extends SearchOptions {
 	provider?: SearchProvider;
 	includeContent?: boolean;
+	zaiApiKey?: string;
 }
 
 function errorMessage(err: unknown): string {
@@ -146,6 +148,14 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		}
 	}
 
+	if (provider === "zai") {
+		const result = await searchWithZai(query, {
+			...options,
+			zaiApiKey: options.zaiApiKey,
+		});
+		return { ...result, provider: "zai" };
+	}
+
 	const fallbackErrors: string[] = [];
 
 	if (provider !== "exa" && isExaAvailable()) {
@@ -155,6 +165,19 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		} catch (err) {
 			if (isAbortError(err)) throw err;
 			fallbackErrors.push(`Exa: ${errorMessage(err)}`);
+		}
+	}
+
+	if (provider !== "zai") {
+		try {
+			const result = await searchWithZai(query, {
+				...options,
+				zaiApiKey: options.zaiApiKey,
+			});
+			return { ...result, provider: "zai" };
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`z.ai: ${errorMessage(err)}`);
 		}
 	}
 
